@@ -1,2 +1,2 @@
 # LOCKIN
-An AI-powered Productivity Tool to Keep You Locked In
+An AI-powered Productivity Tool that Keeps You Locked In
