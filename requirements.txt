@@ -1,0 +1,13 @@
+# mediapipe is pinned to the 0.10.x line deliberately.
+#
+# mediapipe 1.0.x (currently 1.0.1) crashes on macOS arm64 inside
+# TensorsToDetectionsCalculator::Open() -- it unconditionally builds a Metal GPU
+# helper, which aborts the whole process with
+#   "graph_service.h: Check failed: service_ Service is unavailable"
+# before a single frame is processed. Setting delegate=CPU does NOT avoid it.
+# 0.10.35 is the newest release without this bug, and its wheel is py3-tagged so
+# it installs on Python 3.14. Do not "upgrade" this pin without re-running
+# tests/test_detector_smoke.py on macOS.
+mediapipe==0.10.35
+opencv-python==5.0.0.93
+numpy==2.5.2

@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded model asset (3.6 MB). Fetched by scripts/fetch_model.sh;
+# vision/detector.py prints that command if the file is missing.
+models/*.task
+
+# Per-machine webcam geometry -- never shared between users.
+calibration.json
