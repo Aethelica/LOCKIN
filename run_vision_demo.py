@@ -49,7 +49,7 @@ STATE_COLORS = {
 
 
 def open_camera() -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     if not cap.isOpened():
         print(CAMERA_HELP, file=sys.stderr)
         sys.exit(1)
@@ -148,6 +148,7 @@ def main() -> None:
 
         while True:
             ok, frame = cap.read()
+
             if not ok:
                 print("Dropped frame from camera", file=sys.stderr)
                 continue
