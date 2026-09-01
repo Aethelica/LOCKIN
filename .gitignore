@@ -8,3 +8,6 @@ models/*.task
 
 # Per-machine webcam geometry -- never shared between users.
 calibration.json
+
+# API credentials. .env.example is committed as the template; .env never is.
+.env

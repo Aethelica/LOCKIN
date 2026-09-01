@@ -2,6 +2,7 @@
 
     python run_vision_demo.py --calibrate    # do this first, once per setup
     python run_vision_demo.py                # watch it work
+    python run_vision_demo.py --camera 1     # if the wrong camera opens
 
 Keys:  q = quit    c = recalibrate    d = toggle debug numbers
 
@@ -29,15 +30,18 @@ TARGET_FPS = 15.0
 FRAME_INTERVAL = 1.0 / TARGET_FPS
 
 CAMERA_HELP = """\
-Could not open the webcam.
+Could not open webcam index {index}.
 
-On macOS this is almost always a permissions problem rather than a code problem:
-the *terminal app* needs camera access, not Python.
+Two different causes look identical from OpenCV, so check both:
 
-  System Settings -> Privacy & Security -> Camera -> enable your terminal
-  (Terminal, iTerm, VS Code, ...), then restart that app completely.
+1. Wrong index. Macs often expose an iPhone (Continuity Camera) or a virtual
+   camera alongside the built-in one, and the numbering is not stable across
+   reboots. Try:  python run_vision_demo.py --camera 1
 
-OpenCV reports this as "not authorized to capture video"."""
+2. Permissions. On macOS the *terminal app* needs camera access, not Python:
+   System Settings -> Privacy & Security -> Camera -> enable your terminal
+   (Terminal, iTerm, VS Code, ...), then restart that app completely.
+   OpenCV reports this one as "not authorized to capture video"."""
 
 STATE_COLORS = {
     AttentionState.ATTENTIVE: (0, 200, 0),
@@ -48,10 +52,10 @@ STATE_COLORS = {
 }
 
 
-def open_camera() -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(1)
+def open_camera(index: int) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(index)
     if not cap.isOpened():
-        print(CAMERA_HELP, file=sys.stderr)
+        print(CAMERA_HELP.format(index=index), file=sys.stderr)
         sys.exit(1)
     return cap
 
@@ -124,14 +128,44 @@ def draw_overlay(frame, signals, monitor, config, now, show_debug):
     return frame
 
 
+def build_engine(args):
+    """Construct the intervention engine, or exit with a useful message.
+
+    Imported inside the function so the vision demo still runs on a machine
+    with no API key and no anthropic package installed -- the default path
+    through this script must not depend on Phase 3 at all.
+    """
+    from intervention.anthropic_provider import AnthropicProvider
+    from intervention.engine import InterventionEngine
+
+    try:
+        provider = AnthropicProvider()
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
+
+    if not args.task:
+        print('No --task given; reminders will be generic. Try: --task "finish the lab"')
+
+    return InterventionEngine(provider=provider, task=args.task)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lock In webcam attention demo")
     parser.add_argument("--calibrate", action="store_true",
                         help="record a new neutral-pose baseline before running")
+    parser.add_argument("--camera", type=int, default=0, metavar="INDEX",
+                        help="webcam index (default: 0; try 1 if the wrong camera opens)")
+    parser.add_argument("--interventions", action="store_true",
+                        help="generate spoken-style reminders via the LLM (needs .env)")
+    parser.add_argument("--task", default=None, metavar="TEXT",
+                        help='what you are working on, e.g. --task "finish the lab"')
     args = parser.parse_args()
 
+    engine = build_engine(args) if args.interventions else None
+
     calibration = Calibration.load()
-    cap = open_camera()
+    cap = open_camera(args.camera)
 
     with FaceSignalExtractor(calibration) as extractor:
         if args.calibrate or calibration is None:
@@ -143,7 +177,6 @@ def main() -> None:
         monitor = AttentionMonitor(config)
         show_debug = True
         next_frame_at = time.monotonic()
-
         print("\nWatching. Press q to quit, c to recalibrate, d to toggle numbers.\n")
 
         while True:
@@ -168,6 +201,18 @@ def main() -> None:
                 elif isinstance(event, AttentionRestored):
                     print(f"[{event.at:8.1f}s] back on task "
                           f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
+
+                # The single call site for the whole intervention subsystem.
+                # It blocks for up to ~4s while the API answers, which freezes
+                # the video feed -- acceptable because it only happens while
+                # the user is already looking away or out of frame. Phase 4
+                # will move this onto a worker thread when TTS makes the
+                # latency matter; that change touches these three lines only.
+                if engine is not None:
+                    result = engine.handle(event)
+                    if result is not None:
+                        tag = "FALLBACK" if result.is_fallback else "LOCK IN"
+                        print(f"           {tag}: {result.text}")
 
             frame = draw_overlay(frame, signals, monitor, config, now, show_debug)
             cv2.imshow("Lock In - vision", frame)
