@@ -23,3 +23,10 @@ anthropic==1.3.0
 # Reads ANTHROPIC_API_KEY out of a gitignored .env so the key never has to be
 # re-exported in every new terminal, which is a demo-day footgun.
 python-dotenv==1.2.3
+
+# --- Text-to-speech (Phase 4) ---
+#
+# Nothing to install. speech/macos_say.py shells out to /usr/bin/say, which
+# ships with macOS. That is most of why it was chosen over pyttsx3 (two extra
+# dependencies to reach the same synthesiser) or a local neural voice
+# (hundreds of MB of model). See the docstring in speech/macos_say.py.

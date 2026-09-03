@@ -3,6 +3,7 @@
     python scripts/try_intervention.py
     python scripts/try_intervention.py --task "finish the SPIS writeup"
     python scripts/try_intervention.py --fallback     # no API call at all
+    python scripts/try_intervention.py --speak        # ...and say them out loud
 
 This is how you tune prompts/personality in intervention/prompts.py. Sitting in
 front of a camera looking away for three seconds to see one line of output is a
@@ -47,6 +48,8 @@ def main() -> None:
                         help='what the user is working on, e.g. "finish the lab"')
     parser.add_argument("--fallback", action="store_true",
                         help="skip the API entirely and show the canned lines")
+    parser.add_argument("--speak", action="store_true",
+                        help="also send each line to TTS -- the full pipeline, no webcam")
     args = parser.parse_args()
 
     if args.fallback:
@@ -63,6 +66,8 @@ def main() -> None:
 
     print(f"task:  {args.task or '(none given -- try --task)'}\n")
 
+    speech = build_speech() if args.speak else None
+
     # Cooldowns zeroed on purpose: this script's whole job is to show every
     # scenario back to back. The real demo uses the defaults.
     engine = InterventionEngine(
@@ -71,29 +76,71 @@ def main() -> None:
         config=PolicyConfig(global_cooldown_s=0.0, per_kind_cooldown_s=0.0),
     )
 
-    now = 100.0
-    for label, kind, duration in SCENARIOS:
+    try:
+        now = 100.0
+        for label, kind, duration in SCENARIOS:
+            show(engine.handle(DistractionEvent(
+                kind=kind, started_at=now, confirmed_at=now + duration)),
+                label, speech)
+            now += 60.0
+
+        # Absence: the event itself must produce nothing, and the return must
+        # produce the line. Both printed so the deferral is visible.
         show(engine.handle(DistractionEvent(
-            kind=kind, started_at=now, confirmed_at=now + duration)), label)
-        now += 60.0
+            kind=AttentionState.FACE_ABSENT, started_at=now, confirmed_at=now + 1.5)),
+            "left their desk (expected: nothing yet)", speech)
+        show(engine.handle(AttentionRestored(
+            at=now + 240.0, previous=AttentionState.FACE_ABSENT,
+            distracted_duration_s=240.0)), "came back after 4 minutes", speech)
 
-    # Absence: the event itself must produce nothing, and the return must
-    # produce the line. Both printed so the deferral is visible.
-    show(engine.handle(DistractionEvent(
-        kind=AttentionState.FACE_ABSENT, started_at=now, confirmed_at=now + 1.5)),
-        "left their desk (expected: nothing yet)")
-    show(engine.handle(AttentionRestored(
-        at=now + 240.0, previous=AttentionState.FACE_ABSENT,
-        distracted_duration_s=240.0)), "came back after 4 minutes")
+        if speech is not None:
+            drain(speech)
+    finally:
+        if speech is not None:
+            speech.shutdown()
 
 
-def show(result, label: str) -> None:
+def build_speech():
+    """Start the same speech service run_vision_demo.py uses."""
+    from speech.backend import SpeechError  # noqa: PLC0415
+    from speech.macos_say import SayBackend  # noqa: PLC0415
+    from speech.service import SpeechService  # noqa: PLC0415
+
+    try:
+        service = SpeechService(SayBackend())
+    except SpeechError as exc:
+        print(f"[speech] disabled: {exc}", file=sys.stderr)
+        return None
+    service.start()
+    return service
+
+
+def drain(speech, timeout: float = 60.0) -> None:
+    """Hold the process open until the queue is empty, then report the counters."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not speech.is_speaking and speech.pending == 0:
+            break
+        time.sleep(0.05)
+    s = speech.stats
+    print(f"speech: spoken={s.spoken} duplicate={s.dropped_duplicate} "
+          f"stale={s.dropped_stale} overflow={s.dropped_overflow} errors={s.errors}")
+
+
+def show(result, label: str, speech=None) -> None:
     print(f"  {label}")
     if result is None:
         print("    -> (silent)\n")
         return
     tag = "FALLBACK" if result.is_fallback else "llm"
     print(f"    -> [{tag}] {result.text}\n")
+
+    # No created_at here, unlike run_vision_demo.py. This script's timestamps
+    # are synthetic (100.0, 160.0, ...) and are not on the monotonic clock the
+    # service measures staleness against -- passing them would make every line
+    # look decades old and get it dropped. The real demo has real timestamps.
+    if speech is not None:
+        speech.say(result.text)
 
 
 if __name__ == "__main__":

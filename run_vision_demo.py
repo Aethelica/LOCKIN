@@ -4,6 +4,9 @@
     python run_vision_demo.py                # watch it work
     python run_vision_demo.py --camera 1     # if the wrong camera opens
 
+    # the full pipeline: distraction -> LLM -> console -> spoken out loud
+    python run_vision_demo.py --interventions --task "finish the lab"
+
 Keys:  q = quit    c = recalibrate    d = toggle debug numbers
 
 The on-screen overlay is not decoration -- it is the tuning instrument. Watching
@@ -150,6 +153,33 @@ def build_engine(args):
     return InterventionEngine(provider=provider, task=args.task)
 
 
+def build_speech(args):
+    """Construct and start the speech service, or return None.
+
+    Imported inside the function for the same reason build_engine() is: a
+    machine that cannot speak must still be able to run the vision demo.
+    Unlike a missing API key this is never fatal -- speech is an enhancement of
+    the console output, not a replacement for it, so a failure here warns and
+    the app runs on in silence.
+    """
+    if args.no_speak:
+        return None
+
+    from speech.macos_say import SayBackend
+    from speech.service import SpeechConfig, SpeechService
+    from speech.backend import SpeechError
+
+    try:
+        backend = SayBackend(voice=args.voice, rate_wpm=args.rate)
+    except SpeechError as exc:
+        print(f"[speech] disabled: {exc}", file=sys.stderr)
+        return None
+
+    service = SpeechService(backend, SpeechConfig(max_age_s=args.speech_max_age))
+    service.start()
+    return service
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lock In webcam attention demo")
     parser.add_argument("--calibrate", action="store_true",
@@ -160,74 +190,110 @@ def main() -> None:
                         help="generate spoken-style reminders via the LLM (needs .env)")
     parser.add_argument("--task", default=None, metavar="TEXT",
                         help='what you are working on, e.g. --task "finish the lab"')
+    parser.add_argument("--no-speak", action="store_true",
+                        help="print reminders but do not say them out loud")
+    parser.add_argument("--voice", default="Samantha", metavar="NAME",
+                        help="macOS voice (python scripts/try_speech.py --voices)")
+    parser.add_argument("--rate", type=int, default=185, metavar="WPM",
+                        help="speaking rate in words per minute (default: 185)")
+    parser.add_argument("--speech-max-age", type=float, default=25.0, metavar="SEC",
+                        help="discard a queued reminder older than this (default: 25)")
     args = parser.parse_args()
 
     engine = build_engine(args) if args.interventions else None
+    # Speech only exists to voice the engine's output, so there is nothing to
+    # start without it.
+    speech = build_speech(args) if engine is not None else None
 
     calibration = Calibration.load()
     cap = open_camera(args.camera)
 
-    with FaceSignalExtractor(calibration) as extractor:
-        if args.calibrate or calibration is None:
-            if calibration is None and not args.calibrate:
-                print("No calibration found -- running calibration first.")
-            extractor.calibration = run_calibration(cap, extractor)
-
-        config = DetectionConfig()
-        monitor = AttentionMonitor(config)
-        show_debug = True
-        next_frame_at = time.monotonic()
-        print("\nWatching. Press q to quit, c to recalibrate, d to toggle numbers.\n")
-
-        while True:
-            ok, frame = cap.read()
-
-            if not ok:
-                print("Dropped frame from camera", file=sys.stderr)
-                continue
-
-            now = time.monotonic()
-            # Throttle to TARGET_FPS: the camera hands us frames faster than we
-            # need, and landmarking every one of them wastes CPU.
-            if now < next_frame_at:
-                continue
-            next_frame_at = now + FRAME_INTERVAL
-
-            signals = extractor.process(frame, now)
-            for event in monitor.update(signals):
-                if isinstance(event, DistractionEvent):
-                    print(f"[{event.confirmed_at:8.1f}s] DISTRACTED: {event.kind.value} "
-                          f"(confirmed after {event.latency_s:.1f}s)")
-                elif isinstance(event, AttentionRestored):
-                    print(f"[{event.at:8.1f}s] back on task "
-                          f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
-
-                # The single call site for the whole intervention subsystem.
-                # It blocks for up to ~4s while the API answers, which freezes
-                # the video feed -- acceptable because it only happens while
-                # the user is already looking away or out of frame. Phase 4
-                # will move this onto a worker thread when TTS makes the
-                # latency matter; that change touches these three lines only.
-                if engine is not None:
-                    result = engine.handle(event)
-                    if result is not None:
-                        tag = "FALLBACK" if result.is_fallback else "LOCK IN"
-                        print(f"           {tag}: {result.text}")
-
-            frame = draw_overlay(frame, signals, monitor, config, now, show_debug)
-            cv2.imshow("Lock In - vision", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("d"):
-                show_debug = not show_debug
-            if key == ord("c"):
+    # try/finally so the speech worker is joined and the camera released on
+    # every exit path: q, Ctrl+C, or an exception on the way out.
+    try:
+        with FaceSignalExtractor(calibration) as extractor:
+            if args.calibrate or calibration is None:
+                if calibration is None and not args.calibrate:
+                    print("No calibration found -- running calibration first.")
                 extractor.calibration = run_calibration(cap, extractor)
-                monitor = AttentionMonitor(config)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            config = DetectionConfig()
+            monitor = AttentionMonitor(config)
+            show_debug = True
+            next_frame_at = time.monotonic()
+            print("\nWatching. Press q to quit, c to recalibrate, d to toggle numbers.\n")
+
+            while True:
+                ok, frame = cap.read()
+
+                if not ok:
+                    print("Dropped frame from camera", file=sys.stderr)
+                    continue
+
+                now = time.monotonic()
+                # Throttle to TARGET_FPS: the camera hands us frames faster than
+                # we need, and landmarking every one of them wastes CPU.
+                if now < next_frame_at:
+                    continue
+                next_frame_at = now + FRAME_INTERVAL
+
+                signals = extractor.process(frame, now)
+                for event in monitor.update(signals):
+                    if isinstance(event, DistractionEvent):
+                        print(f"[{event.confirmed_at:8.1f}s] DISTRACTED: {event.kind.value} "
+                              f"(confirmed after {event.latency_s:.1f}s)")
+                    elif isinstance(event, AttentionRestored):
+                        print(f"[{event.at:8.1f}s] back on task "
+                              f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
+
+                    # The single call site for the whole intervention subsystem.
+                    # It still blocks for up to ~4s while the API answers, which
+                    # freezes the video feed -- acceptable because it only
+                    # happens while the user is already looking away.
+                    if engine is not None:
+                        result = engine.handle(event)
+                        if result is not None:
+                            tag = "FALLBACK" if result.is_fallback else "LOCK IN"
+                            print(f"           {tag}: {result.text}")
+
+                            # Speech is the opposite: say() stamps the text and
+                            # returns in microseconds, so the several seconds of
+                            # talking happen on the speech worker while this loop
+                            # keeps grabbing frames and detecting.
+                            #
+                            # result.at is when the distraction was *confirmed*,
+                            # not now -- so the time the LLM spent thinking counts
+                            # against the staleness budget, which is right: the
+                            # user has been waiting through it either way. Both
+                            # clocks are time.monotonic(), so they are comparable.
+                            if speech is not None:
+                                speech.say(result.text, created_at=result.at)
+
+                frame = draw_overlay(frame, signals, monitor, config, now, show_debug)
+                cv2.imshow("Lock In - vision", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("d"):
+                    show_debug = not show_debug
+                if key == ord("c"):
+                    # Recalibration restarts the session, so anything queued is
+                    # about a session that no longer exists.
+                    if speech is not None:
+                        speech.cancel_all()
+                    extractor.calibration = run_calibration(cap, extractor)
+                    monitor = AttentionMonitor(config)
+
+    except KeyboardInterrupt:
+        print("\nstopping")
+    finally:
+        # Speech first: it owns a thread, and shutdown() cuts off whatever is
+        # being said rather than making the user wait out a sentence to quit.
+        if speech is not None:
+            speech.shutdown()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
