@@ -22,6 +22,15 @@ cp .env.example .env                 # then paste your key into .env
 `.env` is gitignored. Without it the vision demo still runs; only
 `--interventions` needs a key.
 
+If your key is *identity-linked* (belongs to you rather than to one workspace),
+the API rejects every request with `400 anthropic-workspace-id is required`.
+Add the workspace id to `.env` as well — see `.env.example` for where to find
+it. Ordinary workspace-scoped keys need nothing extra.
+
+When a call fails for any reason, the reminder falls back to a canned line and
+the first failure is printed to stderr, so a bad key never hides behind
+plausible-looking output.
+
 ## Running
 
 ```bash
