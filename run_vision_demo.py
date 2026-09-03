@@ -7,6 +7,9 @@
     # the full pipeline: distraction -> LLM -> console -> spoken out loud
     python run_vision_demo.py --interventions --task "finish the lab"
 
+    # also listen for the Chrome extension (see extension/ and browser/server.py)
+    python run_vision_demo.py --interventions --browser --task "finish the lab"
+
 Keys:  q = quit    c = recalibrate    d = toggle debug numbers
 
 The on-screen overlay is not decoration -- it is the tuning instrument. Watching
@@ -131,6 +134,78 @@ def draw_overlay(frame, signals, monitor, config, now, show_debug):
     return frame
 
 
+def describe(event) -> str:
+    """One console line for any event, whatever produced it."""
+    if isinstance(event, DistractionEvent):
+        if event.kind is AttentionState.BROWSING_DISTRACTING:
+            return f"[{event.confirmed_at:8.1f}s] DISTRACTED: browsing {event.detail}"
+        return (f"[{event.confirmed_at:8.1f}s] DISTRACTED: {event.kind.value} "
+                f"(confirmed after {event.latency_s:.1f}s)")
+    return (f"[{event.at:8.1f}s] back on task "
+            f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
+
+
+def handle_event(event, engine, speech) -> None:
+    """Print it, maybe generate a reminder, maybe say it out loud.
+
+    The single call site for the whole intervention subsystem, and the reason
+    browser tracking needed no new intervention code: a DistractionEvent from
+    browser/server.py and one from vision/state.py arrive here identically, and
+    everything downstream -- cooldowns, prompt, fallback, speech queue --
+    treats them the same.
+    """
+    print(describe(event))
+
+    if engine is None:
+        return
+
+    # Still blocks for up to ~4s while the API answers, which freezes the video
+    # feed -- acceptable because it only happens while the user is already
+    # distracted.
+    result = engine.handle(event)
+    if result is None:
+        return
+
+    tag = "FALLBACK" if result.is_fallback else "LOCK IN"
+    print(f"           {tag}: {result.text}")
+
+    # Speech is the opposite: say() stamps the text and returns in
+    # microseconds, so the several seconds of talking happen on the speech
+    # worker while the loop keeps grabbing frames and detecting.
+    #
+    # result.at is when the distraction was *confirmed*, not now -- so the time
+    # the LLM spent thinking counts against the staleness budget, which is
+    # right: the user has been waiting through it either way. Every clock in
+    # this app is time.monotonic(), so they are comparable.
+    if speech is not None:
+        speech.say(result.text, created_at=result.at)
+
+
+def build_browser(args):
+    """Start the localhost endpoint the Chrome extension posts to, or None.
+
+    Imported inside the function for the same reason build_engine() is: the
+    default path through this script must not depend on a later phase.
+
+    A failure here is never fatal. The usual cause is another copy of the demo
+    already holding the port, and losing browser tracking is a much smaller
+    problem than refusing to run the webcam at all.
+    """
+    if not args.browser:
+        return None
+
+    from browser.server import BrowserEventServer
+
+    server = BrowserEventServer(port=args.browser_port)
+    try:
+        server.start()
+    except OSError as exc:
+        print(f"[browser] disabled: cannot listen on port {args.browser_port} ({exc})",
+              file=sys.stderr)
+        return None
+    return server
+
+
 def build_engine(args):
     """Construct the intervention engine, or exit with a useful message.
 
@@ -190,6 +265,10 @@ def main() -> None:
                         help="generate spoken-style reminders via the LLM (needs .env)")
     parser.add_argument("--task", default=None, metavar="TEXT",
                         help='what you are working on, e.g. --task "finish the lab"')
+    parser.add_argument("--browser", action="store_true",
+                        help="listen for distraction events from the Chrome extension in extension/")
+    parser.add_argument("--browser-port", type=int, default=8765, metavar="PORT",
+                        help="port for the extension endpoint (default: 8765; must match extension/config.js)")
     parser.add_argument("--no-speak", action="store_true",
                         help="print reminders but do not say them out loud")
     parser.add_argument("--voice", default="Samantha", metavar="NAME",
@@ -204,6 +283,9 @@ def main() -> None:
     # Speech only exists to voice the engine's output, so there is nothing to
     # start without it.
     speech = build_speech(args) if engine is not None else None
+    # Independent of the engine: browser events are worth seeing on the console
+    # even without an API key, exactly as webcam events are.
+    browser = build_browser(args)
 
     calibration = Calibration.load()
     cap = open_camera(args.camera)
@@ -238,36 +320,17 @@ def main() -> None:
                 next_frame_at = now + FRAME_INTERVAL
 
                 signals = extractor.process(frame, now)
-                for event in monitor.update(signals):
-                    if isinstance(event, DistractionEvent):
-                        print(f"[{event.confirmed_at:8.1f}s] DISTRACTED: {event.kind.value} "
-                              f"(confirmed after {event.latency_s:.1f}s)")
-                    elif isinstance(event, AttentionRestored):
-                        print(f"[{event.at:8.1f}s] back on task "
-                              f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
+                events = monitor.update(signals)
 
-                    # The single call site for the whole intervention subsystem.
-                    # It still blocks for up to ~4s while the API answers, which
-                    # freezes the video feed -- acceptable because it only
-                    # happens while the user is already looking away.
-                    if engine is not None:
-                        result = engine.handle(event)
-                        if result is not None:
-                            tag = "FALLBACK" if result.is_fallback else "LOCK IN"
-                            print(f"           {tag}: {result.text}")
+                # The browser's events join the webcam's here and are then
+                # indistinguishable. drain() is non-blocking and returns an
+                # empty list almost every frame; the HTTP thread does the
+                # waiting, this loop never does.
+                if browser is not None:
+                    events.extend(browser.drain())
 
-                            # Speech is the opposite: say() stamps the text and
-                            # returns in microseconds, so the several seconds of
-                            # talking happen on the speech worker while this loop
-                            # keeps grabbing frames and detecting.
-                            #
-                            # result.at is when the distraction was *confirmed*,
-                            # not now -- so the time the LLM spent thinking counts
-                            # against the staleness budget, which is right: the
-                            # user has been waiting through it either way. Both
-                            # clocks are time.monotonic(), so they are comparable.
-                            if speech is not None:
-                                speech.say(result.text, created_at=result.at)
+                for event in events:
+                    handle_event(event, engine, speech)
 
                 frame = draw_overlay(frame, signals, monitor, config, now, show_debug)
                 cv2.imshow("Lock In - vision", frame)
@@ -292,6 +355,8 @@ def main() -> None:
         # being said rather than making the user wait out a sentence to quit.
         if speech is not None:
             speech.shutdown()
+        if browser is not None:
+            browser.shutdown()
         cap.release()
         cv2.destroyAllWindows()
 

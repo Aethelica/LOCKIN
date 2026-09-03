@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Lock In - activity tracker",
+  "version": "0.1.0",
+  "description": "Tells the Lock In backend when the active tab is on a blacklisted site. Sends nothing else.",
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "permissions": [
+    "tabs",
+    "storage"
+  ],
+
+  "host_permissions": [
+    "http://127.0.0.1:8765/*"
+  ]
+}

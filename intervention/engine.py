@@ -100,7 +100,12 @@ class InterventionEngine:
         # machine confirmed it -- and we speak at that same moment, so it is
         # the true elapsed time. Reading a live clock here instead would add
         # nondeterminism for a difference of milliseconds.
-        return self._speak(event.kind, event.confirmed_at, event.latency_s)
+        #
+        # A browser event arrives with latency_s == 0 and a domain in .detail;
+        # prompts.py reads the domain instead of the duration for that kind.
+        return self._speak(
+            event.kind, event.confirmed_at, event.latency_s, detail=event.detail
+        )
 
     def _on_restored(self, event: AttentionRestored) -> Intervention | None:
         """Deliver the deferred absence line, if that's what just ended.
@@ -125,7 +130,11 @@ class InterventionEngine:
     # -- shared path -----------------------------------------------------------
 
     def _speak(
-        self, kind: AttentionState, now: float, duration_s: float
+        self,
+        kind: AttentionState,
+        now: float,
+        duration_s: float,
+        detail: str | None = None,
     ) -> Intervention | None:
         """Gate, generate, fall back, record. The only place text is produced."""
         if not self.policy.should_intervene(kind, now):
@@ -136,6 +145,7 @@ class InterventionEngine:
             duration_s=duration_s,
             task=self.task,
             recent_lines=tuple(self._recent),
+            detail=detail,
         )
 
         try:

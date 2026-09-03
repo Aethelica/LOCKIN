@@ -19,8 +19,8 @@ _BEHAVIOR = {
 }
 
 SYSTEM_PROMPT = """\
-You are the voice of Lock In, a study tool that watches a webcam and notices \
-when someone's attention drifts.
+You are the voice of Lock In, a study tool that watches a webcam and the \
+user's browser, and notices when someone's attention drifts.
 
 Write ONE line to pull them back to their work.
 
@@ -41,8 +41,15 @@ def build_user_message(request) -> str:
     Takes the request rather than loose arguments so adding a field later (time
     of day, session length) is a change to this function alone.
     """
-    behavior = _BEHAVIOR.get(request.kind, "stopped paying attention")
-    lines = [f"They have {behavior} for about {request.duration_s:.0f} seconds."]
+    if request.kind is AttentionState.BROWSING_DISTRACTING:
+        # Browsing is the one kind with no duration worth quoting -- the
+        # extension reports the moment the tab lands on the site, not how long
+        # it has been open -- and the one kind with a name for the distraction.
+        site = request.detail or "a distracting website"
+        lines = [f"They just opened {site} in their browser."]
+    else:
+        behavior = _BEHAVIOR.get(request.kind, "stopped paying attention")
+        lines = [f"They have {behavior} for about {request.duration_s:.0f} seconds."]
 
     if request.task:
         lines.append(f'They are supposed to be working on: "{request.task}".')
@@ -83,6 +90,13 @@ FALLBACK_LINES = {
         "Welcome back. The work waited, unfortunately.",
         "Good break. Now the boring part.",
         "The document is exactly where you left it.",
+    ),
+    # Deliberately domain-agnostic like the rest: the fallback path is exactly
+    # the path where we cannot do anything clever with context.
+    AttentionState.BROWSING_DISTRACTING: (
+        "That tab was not on the plan.",
+        "Interesting choice of research material.",
+        "Close it. You opened it on purpose and we both know it.",
     ),
 }
 

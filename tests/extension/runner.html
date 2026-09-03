@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lock In - extension domain tests</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, Menlo, monospace; margin: 2rem; }
+  #summary { font-size: 1.3rem; font-weight: bold; margin-bottom: 1rem; }
+  .pass { color: #0a7; } .fail { color: #c00; font-weight: bold; }
+  li { list-style: none; }
+</style>
+<!--
+  Serves the pure functions in extension/domains.js to the real browser URL
+  parser. From the repo root:   python3 -m http.server 8000
+  then open  http://localhost:8000/tests/extension/runner.html
+-->
+<h1>extension/domains.js</h1>
+<div id="summary">running…</div>
+<ul id="out"></ul>
+<script type="module">
+  import { results } from "./domains.test.js";
+  const failed = results.filter(r => !r.pass);
+  document.getElementById("summary").textContent =
+    failed.length === 0
+      ? `ALL ${results.length} TESTS PASSED`
+      : `${failed.length} of ${results.length} FAILED`;
+  document.getElementById("summary").className = failed.length ? "fail" : "pass";
+  document.getElementById("out").innerHTML = results.map(r =>
+    `<li class="${r.pass ? "pass" : "fail"}">${r.pass ? "PASS" : "FAIL"} — ${r.name}` +
+    (r.pass ? "" : ` (got ${JSON.stringify(r.actual)}, expected ${JSON.stringify(r.expected)})`) +
+    `</li>`).join("");
+  console.log(`[lockin tests] ${results.length - failed.length}/${results.length} passed`);
+  for (const f of failed) console.error("FAIL", f.name, f);
+</script>

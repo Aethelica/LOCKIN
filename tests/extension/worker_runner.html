@@ -1,0 +1,101 @@
+<!doctype html>
+<meta charset="utf-8"><title>Lock In - background.js harness</title>
+<style>body{font:13px/1.5 ui-monospace,Menlo,monospace;margin:2rem}
+pre{background:#f4f4f4;padding:1rem;white-space:pre-wrap}</style>
+<!--
+  Drives extension/background.js in a real browser with a stubbed chrome.* API.
+
+  Why this exists: Chrome 137+ removed --load-extension, so a real unpacked
+  extension cannot be loaded from a script. This harness runs the SAME
+  background.js unmodified, with the real URL parser and a REAL fetch to the
+  real Python backend, and fakes only the four chrome.* calls the file makes.
+  It verifies the state machine, the suppression rule, and the network handling.
+  It does NOT verify that Chrome fires the listeners as expected -- that part
+  needs a human to click "Load unpacked" once. See README.
+
+      python3 -m http.server 8000
+      python3 scripts/try_browser.py
+      open http://localhost:8000/tests/extension/worker_runner.html
+-->
+<h1>background.js harness</h1>
+<pre id="out">ready</pre>
+<script type="module">
+const log = [];
+const sent = [];        // payloads background.js actually POSTed
+const listeners = { activated: [], updated: [], focus: [], startup: [], installed: [] };
+const sessionStore = {};   // survives "worker restarts", like chrome.storage.session
+
+let activeUrl = null;      // what chrome.tabs.query will report
+
+const evt = (bucket) => ({ addListener: (fn) => listeners[bucket].push(fn) });
+
+globalThis.chrome = {
+  tabs: {
+    onActivated: evt("activated"),
+    onUpdated: evt("updated"),
+    // Mirrors the real signature: an array, `url` absent for non-web tabs.
+    query: async () => [{ active: true, url: activeUrl ?? undefined }],
+  },
+  windows: {
+    WINDOW_ID_NONE: -1,
+    onFocusChanged: evt("focus"),
+  },
+  storage: {
+    session: {
+      get: async (key) => (key in sessionStore ? { [key]: sessionStore[key] } : {}),
+      set: async (obj) => Object.assign(sessionStore, obj),
+    },
+  },
+  runtime: { onStartup: evt("startup"), onInstalled: evt("installed") },
+};
+
+// Record what is sent, then really send it. The backend, the CORS preflight and
+// the failure path are all genuine.
+const realFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (url, init) => {
+  sent.push({ url, body: JSON.parse(init.body) });
+  return realFetch(url, init);
+};
+
+for (const m of ["log", "warn", "error"]) {
+  const real = console[m].bind(console);
+  console[m] = (...a) => { log.push(`${m}: ${a.join(" ")}`); real(...a); };
+}
+
+// Fresh module instance == fresh MV3 service worker (module-level `cached`
+// starts undefined again) while sessionStore survives, exactly like the real
+// thing. The query string is what defeats the ES module cache.
+let generation = 0;
+async function startWorker() {
+  for (const k of Object.keys(listeners)) listeners[k] = [];
+  generation += 1;
+  await import(`../../extension/background.js?worker=${generation}`);
+  await settle();
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 250));
+
+async function fire(bucket, ...args) {
+  for (const fn of listeners[bucket]) fn(...args);
+  await settle();
+}
+
+window.T = {
+  startWorker,
+  restartWorker: startWorker,
+  /** Put the active tab on `url`, then fire the listener a real Chrome would. */
+  async goto(url, how = "updated") {
+    activeUrl = url;
+    if (how === "updated") await fire("updated", 1, { url });
+    else if (how === "activated") await fire("activated", { tabId: 1 });
+    else if (how === "focus") await fire("focus", 7);
+    return this.take();
+  },
+  async blurChrome() { await fire("focus", -1); return this.take(); },
+  /** Payloads sent since the last take(). */
+  take() { const s = sent.splice(0); return s.map((x) => x.body); },
+  logs() { return log.splice(0); },
+  state() { return sessionStore; },
+};
+document.getElementById("out").textContent = "harness ready";
+</script>

@@ -49,6 +49,11 @@ class InterventionRequest:
     # likes and reusing it until the user stops hearing it.
     recent_lines: tuple[str, ...] = ()
 
+    # Carried through from DistractionEvent.detail: a short specifier for kinds
+    # that have one, currently just the blacklisted domain on a browsing event.
+    # Appended last so existing positional construction is unaffected.
+    detail: str | None = None
+
 
 class InterventionProvider(Protocol):
     """One method. That narrowness is the entire point.
