@@ -122,7 +122,10 @@ def test_posted_event_reaches_the_queue(server):
                  "domain": "reddit.com"}
     )
     assert status == 202
-    assert body == {"ok": True}
+    assert body["ok"] is True
+    # has_task tells the extension whether this backend already knows the task,
+    # which is how a task survives a backend restart without polling.
+    assert body["has_task"] is False
 
     events = server.drain()
     assert len(events) == 1
@@ -290,3 +293,161 @@ def test_prompt_names_the_site_and_not_a_duration():
     assert "youtube.com" in message
     assert "write the lab report" in message
     assert "0 seconds" not in message
+
+
+# -- the UI routes: /status, /task, /test -------------------------------------
+#
+# Added with the popup. Same server and same threading model as above, so these
+# reuse post()/urlopen against a real socket rather than mocking the handler.
+
+
+@pytest.fixture
+def ui_server():
+    """A server with an AppState attached, as run_vision_demo.py builds it."""
+    from browser.state import AppState
+
+    srv = BrowserEventServer(port=0, verbose=False, state=AppState())
+    srv.start()
+    yield srv
+    srv.shutdown()
+
+
+def get(server, path="/status"):
+    request = urllib.request.Request(f"http://127.0.0.1:{server.port}{path}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_ui_routes_are_503_without_a_state(server):
+    """Tracking works with no popup session; the UI routes say so honestly."""
+    assert get(server, "/status")[0] == 503
+    assert post(server, {"task": "x"}, path="/task")[0] == 503
+    assert post(server, {}, path="/test")[0] == 503
+    # ...but the tracking route is unaffected, which is the point.
+    assert post(server, {"reason": "blacklisted_domain", "domain": "x.com"})[0] == 202
+
+
+def test_status_reports_a_fresh_session(ui_server):
+    status, body = get(ui_server)
+    assert status == 200
+    assert body["task"] is None
+    assert body["attention"] is None          # no webcam session
+    assert body["recent"] == []
+    assert body["stats"] == {"events": 0, "reminders": 0, "suppressed": 0}
+    assert len(body["session"]) == 8
+
+
+def test_task_round_trips(ui_server):
+    status, body = post(ui_server, {"task": "  finish the lab  "}, path="/task")
+    assert status == 200
+    assert body["task"] == "finish the lab"       # trimmed
+    assert get(ui_server)[1]["task"] == "finish the lab"
+
+
+def test_blank_task_clears_it(ui_server):
+    post(ui_server, {"task": "something"}, path="/task")
+    assert post(ui_server, {"task": "   "}, path="/task")[1]["task"] is None
+    assert get(ui_server)[1]["task"] is None
+
+
+@pytest.mark.parametrize("payload", [{"task": 123}, {"task": ["a"]}, {"task": "x" * 201}])
+def test_bad_tasks_are_refused(ui_server, payload):
+    assert post(ui_server, payload, path="/task")[0] == 400
+    assert get(ui_server)[1]["task"] is None
+
+
+def test_event_response_tells_the_extension_whether_a_task_is_set(ui_server):
+    """The whole task-survives-a-restart mechanism rests on this one flag."""
+    body = post(ui_server, {"reason": "blacklisted_domain", "domain": "x.com"})[1]
+    assert body["has_task"] is False
+
+    post(ui_server, {"task": "finish the lab"}, path="/task")
+    body = post(ui_server, {"reason": "blacklisted_domain", "domain": "y.com"})[1]
+    assert body["has_task"] is True
+
+
+def test_test_route_queues_a_rehearsal_without_counting_an_event(ui_server):
+    assert post(ui_server, {"domain": "youtube.com"}, path="/test")[0] == 202
+    assert ui_server.drain_tests() == ["youtube.com"]
+    assert ui_server.drain_tests() == []
+    # A rehearsal is not a distraction and must not inflate the stats.
+    assert get(ui_server)[1]["stats"]["events"] == 0
+    # ...and it is not a DistractionEvent either.
+    assert ui_server.drain() == []
+
+
+def test_test_route_accepts_no_domain(ui_server):
+    assert post(ui_server, {}, path="/test")[0] == 202
+    assert ui_server.drain_tests() == [None]
+
+
+def test_test_route_validates_the_domain(ui_server):
+    assert post(ui_server, {"domain": "not a domain"}, path="/test")[0] == 400
+    assert ui_server.drain_tests() == []
+
+
+def test_rehearsal_queue_is_bounded(ui_server):
+    for _ in range(10):
+        post(ui_server, {}, path="/test")
+    assert len(ui_server.drain_tests()) <= 2
+
+
+def test_status_reflects_events_and_reminders(ui_server):
+    from vision.signals import AttentionState
+
+    state = ui_server.state
+    state.set_attention(AttentionState.LOOKING_DOWN)
+    state.record_event()
+    state.record_event()
+    state.record_intervention("Put it face down.", AttentionState.LOOKING_DOWN,
+                              None, "llm", 100.0)
+
+    body = get(ui_server)[1]
+    assert body["attention"] == "looking_down"
+    # One of two events became a reminder; the other was held by the cooldown.
+    assert body["stats"] == {"events": 2, "reminders": 1, "suppressed": 1}
+    assert body["recent"][0]["text"] == "Put it face down."
+    assert body["recent"][0]["source"] == "llm"
+
+
+def test_recent_is_newest_first_and_bounded(ui_server):
+    from browser.state import RECENT_LIMIT
+    from vision.signals import AttentionState
+
+    for i in range(RECENT_LIMIT + 3):
+        ui_server.state.record_intervention(f"line {i}", AttentionState.LOOKING_AWAY,
+                                            None, "llm", float(i))
+    recent = get(ui_server)[1]["recent"]
+    assert len(recent) == RECENT_LIMIT
+    assert recent[0]["text"] == f"line {RECENT_LIMIT + 2}"
+
+
+def test_rehearse_ignores_the_cooldown_but_does_not_consume_it():
+    """The test button must work during a cooldown, and must not eat the budget."""
+    engine = InterventionEngine(provider=FakeProvider())
+
+    first = parse_event({"reason": "blacklisted_domain", "domain": "youtube.com"},
+                        now=100.0)
+    assert engine.handle(first) is not None
+    assert engine.policy.count == 1
+
+    # Seconds later, inside the global cooldown: a real event is suppressed...
+    second = parse_event({"reason": "blacklisted_domain", "domain": "reddit.com"},
+                         now=102.0)
+    assert engine.handle(second) is None
+
+    # ...but a rehearsal still speaks.
+    rehearsal = engine.rehearse(103.0, AttentionState.BROWSING_DISTRACTING, "reddit.com")
+    assert rehearsal is not None
+    assert rehearsal.detail == "reddit.com"
+    assert engine.policy.count == 1          # unchanged: no budget consumed
+
+
+def test_rehearse_falls_back_when_the_api_is_down():
+    engine = InterventionEngine(provider=DeadProvider())
+    result = engine.rehearse(1.0)
+    assert result.is_fallback
+    assert result.text

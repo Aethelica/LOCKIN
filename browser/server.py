@@ -10,19 +10,32 @@
 
 WHY AN HTTP SERVER AT ALL. A Chrome extension cannot import Python, and a
 service worker cannot write to a file the app is watching. The narrowest channel
-Chrome offers is `fetch` to a localhost port, so that is what this is: one POST
-route, one health route, and nothing else.
+Chrome offers is `fetch` to a localhost port, so that is what this is.
+
+Five routes, in two groups:
+
+    POST /event     the extension reports a blacklisted domain      (tracking)
+    GET  /health    is anything listening?                          (tracking)
+
+    GET  /status    everything the popup displays                   (the UI)
+    POST /task      set what the user is working on                 (the UI)
+    POST /test      fire one reminder on demand                     (the UI)
+
+The tracking routes work with no AppState attached, which is why the extension
+keeps tracking correctly whether or not anyone ever opens the popup. The UI
+routes answer 503 when no AppState was supplied, rather than pretending.
 
 WHY THE STANDARD LIBRARY. Flask or FastAPI would each add a dependency (and a
-web framework's worth of concepts) to receive a four-field JSON object. Two
-routes do not justify that. `http.server` is not a production web server, but
-this one only ever answers one client, on the loopback interface, on one machine.
+web framework's worth of concepts) to serve five small routes to exactly one
+client, on the loopback interface, on one machine. `http.server` is not a
+production web server; it does not need to be.
 
-WHY IT DOES NOT SPEAK OR CALL AN LLM. This file's entire job is to turn an HTTP
-request into a DistractionEvent and put it in a queue. Everything after that --
-whether to interrupt, what to say, whether to say it aloud -- is decided by
-intervention/policy.py and speech/service.py exactly as it is for the webcam.
-There is one intervention pipeline, not two.
+WHY IT DOES NOT SPEAK OR CALL AN LLM. No route here generates text or makes a
+sound. /event and /test both do the same thing: put something in a queue for the
+frame loop to pick up. Everything after that -- whether to interrupt, what to
+say, whether to say it aloud -- is decided by intervention/ and speech/ exactly
+as it is for the webcam. There is one intervention pipeline, not two, and no
+network call ever happens on an HTTP worker thread.
 
 PRIVACY. The extension sends a bare blacklisted domain and nothing else: no
 URLs, no page titles, no query strings, no browsing history, no data at all
@@ -47,11 +60,21 @@ from typing import Callable
 
 from vision.signals import AttentionState, DistractionEvent
 
+from .state import AppState
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 EVENT_PATH = "/event"
 HEALTH_PATH = "/health"
+STATUS_PATH = "/status"
+TASK_PATH = "/task"
+TEST_PATH = "/test"
+
+# A task is one line the user types about their own work. Long enough for a real
+# sentence, short enough that it cannot become a prompt-injection payload with
+# room to work in.
+MAX_TASK_LEN = 200
 
 # The payload is four short fields. Anything larger is a bug or an attack, and
 # reading it before deciding that would be the bug.
@@ -63,6 +86,10 @@ MAX_BODY_BYTES = 2048
 # blocked in an API call. Oldest is dropped, matching speech/service.py: the
 # freshest event is the relevant one.
 MAX_QUEUED = 8
+
+# Rehearsals are user-initiated and each costs an API call, so the ceiling is
+# much lower than for events.
+MAX_QUEUED_TESTS = 2
 
 # Hostnames only: letters, digits, dots and hyphens, 253 characters at most.
 # Deliberately strict, because this string ends up inside an LLM prompt --
@@ -101,6 +128,11 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
 # 0.5s, which makes every shutdown -- including the one in every test -- take
 # half a second for no reason.
 _POLL_INTERVAL_S = 0.1
+
+
+# Returned by _read_json when it has already answered the request. Not None,
+# because None is a legitimate decoded JSON body.
+_BAD = object()
 
 
 class PayloadError(ValueError):
@@ -169,14 +201,23 @@ class BrowserEventServer:
         port: int = DEFAULT_PORT,
         clock: Callable[[], float] = time.monotonic,
         verbose: bool = True,
+        state: "AppState | None" = None,
     ) -> None:
         self.host = host
         self.port = port
         self._clock = clock
         self._verbose = verbose
 
+        # Optional so the tracking routes keep working on their own. When it is
+        # None the three UI routes answer 503 instead of inventing data.
+        self.state = state
+
         self._lock = threading.Lock()
         self._queue: deque[DistractionEvent] = deque()
+        # Rehearsal requests from the popup's test button. Kept apart from the
+        # event queue because a rehearsal is not a distraction: it must not be
+        # counted as one, and it deliberately ignores the cooldown.
+        self._tests: deque[str | None] = deque()
         self.stats = BrowserStats()
 
         self._httpd: ThreadingHTTPServer | None = None
@@ -254,6 +295,23 @@ class BrowserEventServer:
         with self._lock:
             return len(self._queue)
 
+    # -- rehearsals ------------------------------------------------------------
+
+    def _submit_test(self, domain: str | None) -> None:
+        with self._lock:
+            # Two is plenty. Someone leaning on the button should not be able to
+            # queue twenty API calls the loop then works through one by one.
+            while len(self._tests) >= MAX_QUEUED_TESTS:
+                self._tests.popleft()
+            self._tests.append(domain)
+
+    def drain_tests(self) -> list[str | None]:
+        """Take any pending rehearsal requests. Called from the frame loop."""
+        with self._lock:
+            tests = list(self._tests)
+            self._tests.clear()
+        return tests
+
 
 def _make_handler(server: BrowserEventServer) -> type[BaseHTTPRequestHandler]:
     """Build a handler class bound to one BrowserEventServer instance.
@@ -270,27 +328,59 @@ def _make_handler(server: BrowserEventServer) -> type[BaseHTTPRequestHandler]:
         # -- routes ------------------------------------------------------------
 
         def do_POST(self) -> None:  # noqa: N802  (name fixed by BaseHTTPRequestHandler)
-            if self.path != EVENT_PATH:
+            if self.path not in (EVENT_PATH, TASK_PATH, TEST_PATH):
                 self._json(404, {"error": "not found"})
                 return
 
+            payload = self._read_json()
+            if payload is _BAD:
+                return
+
+            if self.path == EVENT_PATH:
+                self._handle_event(payload)
+            elif self.path == TASK_PATH:
+                self._handle_task(payload)
+            else:
+                self._handle_test(payload)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == HEALTH_PATH:
+                self._json(200, {"ok": True, "service": "lockin"})
+                return
+            if self.path == STATUS_PATH:
+                if server.state is None:
+                    self._json(503, {"error": "no session is publishing status"})
+                    return
+                self._json(200, server.state.as_json())
+                return
+            self._json(404, {"error": "not found"})
+
+        # -- POST bodies -------------------------------------------------------
+
+        def _read_json(self):
+            """Decode the request body, or answer 400 and return _BAD."""
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 self._reject("bad Content-Length")
-                return
+                return _BAD
 
             if length <= 0 or length > MAX_BODY_BYTES:
                 self._reject(f"body length {length} out of range")
-                return
+                return _BAD
 
-            body = self.rfile.read(length)
             try:
-                payload = json.loads(body)
+                payload = json.loads(self.rfile.read(length))
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._reject(f"malformed JSON ({exc})")
-                return
+                return _BAD
 
+            if not isinstance(payload, dict):
+                self._reject("body must be a JSON object")
+                return _BAD
+            return payload
+
+        def _handle_event(self, payload: dict) -> None:
             try:
                 event = parse_event(payload, server._clock())
             except PayloadError as exc:
@@ -300,16 +390,59 @@ def _make_handler(server: BrowserEventServer) -> type[BaseHTTPRequestHandler]:
             server._submit(event)
             if server._verbose:
                 print(f"[browser] distraction: {event.detail}")
+
             # 202, not 200: accepted for processing. Whether it becomes a spoken
             # reminder is up to the cooldown policy several steps later, and the
             # extension is not told -- it has no business knowing.
-            self._json(202, {"ok": True})
+            #
+            # has_task is the one thing it IS told, and it is what makes the
+            # task survive a backend restart without any polling: a restarted
+            # Lock In answers False, and the extension pushes the task it has
+            # stored on the very next event. See send() in background.js.
+            self._json(202, {
+                "ok": True,
+                "has_task": bool(server.state and server.state.task),
+            })
 
-        def do_GET(self) -> None:  # noqa: N802
-            if self.path != HEALTH_PATH:
-                self._json(404, {"error": "not found"})
+        def _handle_task(self, payload: dict) -> None:
+            if server.state is None:
+                self._json(503, {"error": "no session is publishing status"})
                 return
-            self._json(200, {"ok": True, "service": "lockin"})
+
+            task = payload.get("task")
+            if task is not None and not isinstance(task, str):
+                self._reject("task must be a string or null")
+                return
+            if isinstance(task, str) and len(task) > MAX_TASK_LEN:
+                self._reject(f"task longer than {MAX_TASK_LEN} characters")
+                return
+
+            stored = server.state.set_task(task)
+            if server._verbose:
+                print(f"[browser] task set to: {stored!r}")
+            self._json(200, {"ok": True, "task": stored})
+
+        def _handle_test(self, payload: dict) -> None:
+            """Queue one rehearsal. Generation happens on the frame loop."""
+            if server.state is None:
+                self._json(503, {"error": "no session is publishing status"})
+                return
+
+            domain = payload.get("domain")
+            if domain is not None:
+                if not isinstance(domain, str):
+                    self._reject("domain must be a string or null")
+                    return
+                domain = domain.strip().rstrip(".").lower()
+                if len(domain) > MAX_DOMAIN_LEN or not _DOMAIN_RE.match(domain):
+                    self._reject(f"not a bare domain: {domain[:60]!r}")
+                    return
+
+            server._submit_test(domain)
+            if server._verbose:
+                print(f"[browser] test reminder requested"
+                      + (f" for {domain}" if domain else ""))
+            self._json(202, {"ok": True})
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             """CORS preflight.
@@ -343,7 +476,7 @@ def _make_handler(server: BrowserEventServer) -> type[BaseHTTPRequestHandler]:
         def _reject(self, detail: str) -> None:
             server.stats.rejected += 1
             if server._verbose:
-                print(f"[browser] rejected event: {detail}", file=sys.stderr)
+                print(f"[browser] rejected request: {detail}", file=sys.stderr)
             self._json(400, {"error": detail})
 
         def log_message(self, fmt: str, *args) -> None:

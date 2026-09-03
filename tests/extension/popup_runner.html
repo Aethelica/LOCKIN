@@ -1,0 +1,86 @@
+<!doctype html>
+<meta charset="utf-8"><title>Lock In - popup harness</title>
+<!--
+  Renders the REAL extension/popup.html + popup.css + popup.js in an ordinary
+  tab, with chrome.tabs and chrome.storage stubbed and a REAL fetch to the
+  running Python backend.
+
+  Same reason worker_runner.html exists: Chrome 137+ removed --load-extension,
+  so the popup cannot be opened from a script. This shows the actual markup and
+  actual logic; only the four chrome.* calls it makes are faked.
+
+      python3 -m http.server 8000
+      python3 scripts/try_browser.py
+      open http://localhost:8000/tests/extension/popup_runner.html
+
+  Change the simulated tab with:  setTab("https://www.youtube.com/")
+-->
+<style>
+  body { margin: 0; font: 13px system-ui, sans-serif; background: #8a8a92; }
+  #bar { padding: 8px 12px; background: #26262b; color: #ddd; font: 12px ui-monospace, monospace; }
+  #frame { width: 320px; margin: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.35);
+           border-radius: 10px; overflow: hidden; }
+</style>
+<div id="bar">popup harness — <code>setTab(url)</code> changes the active tab (reloads) · <code>resetHarness()</code> clears stored state</div>
+<div id="frame"></div>
+
+<script type="module">
+// Backed by sessionStorage so they survive a page reload, because a reload is
+// how this harness models "the user closed and reopened the popup" -- the real
+// popup is destroyed every time it closes, while chrome.storage.local is not.
+const persist = (key, fallback) => {
+  try { return JSON.parse(sessionStorage.getItem(key)) ?? fallback; }
+  catch { return fallback; }
+};
+const save = (key, value) => sessionStorage.setItem(key, JSON.stringify(value));
+
+const local = persist("h.local", {});
+const session = persist("h.session", {});
+const changeListeners = [];
+let tabUrl = persist("h.tab", "https://docs.google.com/document/d/abc/edit");
+
+const area = (store, name) => ({
+  get: async (key) => (key in store ? { [key]: store[key] } : {}),
+  set: async (obj) => {
+    const changes = {};
+    for (const [k, v] of Object.entries(obj)) {
+      changes[k] = { oldValue: store[k], newValue: v };
+      store[k] = v;
+    }
+    save(`h.${name}`, store);
+    changeListeners.forEach((fn) => fn(changes, name));
+  },
+  remove: async (key) => {
+    const changes = { [key]: { oldValue: store[key], newValue: undefined } };
+    delete store[key];
+    save(`h.${name}`, store);
+    changeListeners.forEach((fn) => fn(changes, name));
+  },
+});
+
+globalThis.chrome = {
+  tabs: { query: async () => [{ active: true, url: tabUrl }] },
+  storage: {
+    local: area(local, "local"),
+    session: area(session, "session"),
+    onChanged: { addListener: (fn) => changeListeners.push(fn) },
+  },
+};
+
+// Mount the real popup document into this page.
+const html = await (await fetch("../../extension/popup.html")).text();
+const doc = new DOMParser().parseFromString(html, "text/html");
+const css = document.createElement("link");
+css.rel = "stylesheet";
+css.href = "../../extension/popup.css";
+document.head.append(css);
+document.getElementById("frame").innerHTML = doc.body.innerHTML;
+
+/** Move the simulated active tab. Reloads, which is how a real popup behaves:
+ *  it is created fresh every time you click the toolbar icon. */
+globalThis.setTab = (url) => { save("h.tab", url); location.reload(); };
+globalThis.storage = () => ({ local, session });
+globalThis.resetHarness = () => { sessionStorage.clear(); location.reload(); };
+
+await import("../../extension/popup.js");
+</script>

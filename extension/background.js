@@ -34,10 +34,10 @@
  * neither has to know the other's numbers.
  */
 
-import { BACKEND_URL, BLACKLIST, REQUEST_TIMEOUT_MS } from "./config.js";
-import { hostnameOf, matchBlacklist, normalizeBlacklist } from "./domains.js";
-
-const BLOCKED = normalizeBlacklist(BLACKLIST);
+import { EVENT_URL, REQUEST_TIMEOUT_MS, TASK_URL } from "./config.js";
+import { getBlacklist } from "./blacklist.js";
+import { hostnameOf, matchBlacklist } from "./domains.js";
+import { getTask } from "./task.js";
 
 /** Key under which the current blacklisted entry (or null) is remembered. */
 const STATE_KEY = "blockedDomain";
@@ -101,7 +101,11 @@ async function activeTabUrl() {
 
 async function evaluate(trigger) {
   const hostname = hostnameOf(await activeTabUrl());
-  const matched = hostname ? matchBlacklist(hostname, BLOCKED) : null;
+  // Read the list fresh rather than caching it in a module variable. The popup
+  // can change it at any moment, and a service worker that is asleep when the
+  // user edits the list would otherwise wake up with a stale copy.
+  const blocked = hostname ? await getBlacklist() : [];
+  const matched = hostname ? matchBlacklist(hostname, blocked) : null;
 
   console.log(
     `[lockin] ${trigger}: ${hostname ?? "(not a web page)"} -> ` +
@@ -117,7 +121,15 @@ async function evaluate(trigger) {
     console.log("[lockin] back on a productive site; browsing state reset");
     return;
   }
-  await send(matched);
+  const delivered = await send(matched);
+
+  // Rolling the state back on failure is the fix for a specific demo-day
+  // failure: start Chrome on YouTube, start Lock In afterwards, and the event
+  // that mattered was already dropped -- with no retry, nothing fires until you
+  // navigate away and back. Forgetting the domain means the next navigation
+  // tries again. The cost is one failed fetch per navigation while Lock In is
+  // down, which is a refused connection and returns instantly.
+  if (!delivered) await writeState(null);
 }
 
 /**
@@ -142,32 +154,56 @@ async function send(domain) {
   };
 
   try {
-    const response = await fetch(BACKEND_URL, {
+    const response = await fetch(EVENT_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    if (response.ok) {
-      console.log(`[lockin] sent ${domain}; backend accepted (${response.status})`);
-    } else {
+    if (!response.ok) {
       console.warn(`[lockin] sent ${domain}; backend refused it (${response.status})`);
+      return true;
     }
+
+    console.log(`[lockin] sent ${domain}; backend accepted (${response.status})`);
+
+    // A Lock In that has just restarted answers has_task:false. Pushing the
+    // stored task here is what makes it survive a backend restart with no
+    // polling and no heartbeat -- the very next distraction repairs it.
+    const body = await response.json().catch(() => ({}));
+    if (body.has_task === false) await pushTask();
+    return true;
   } catch (err) {
     // The backend being down is the expected case, not an exceptional one --
-    // the user may simply not have started Lock In yet. Log once and drop the
-    // event. No retry loop: a retry would fire while the user is still on the
-    // same site, which is exactly the duplicate this extension exists to
-    // avoid, and a queue of stale events is worth less than nothing.
+    // the user may simply not have started Lock In yet. Log it and drop the
+    // event; there is no retry timer, because a timer would fire while the user
+    // is still on the same site and re-send the duplicate this extension exists
+    // to prevent.
     console.warn(
-      `[lockin] backend unreachable (${BACKEND_URL}); dropping ${domain} event.`,
+      `[lockin] backend unreachable (${EVENT_URL}); dropping ${domain} event.`,
       err.message
     );
+    return false;
   }
-  // Note there is no state rollback on failure. The state means "the user is on
-  // this site", not "the backend was told" -- rolling it back would make the
-  // next in-site navigation look like a fresh entry and re-send.
+}
+
+/** Tell the backend what the user is working on. Silent if it is not running. */
+async function pushTask() {
+  const task = await getTask();
+  if (!task) return;
+  try {
+    await fetch(TASK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    console.log(`[lockin] re-sent the task to a restarted backend`);
+  } catch {
+    // Nothing to do and nothing worth saying: we only got here because an event
+    // just succeeded, so this is a race with a backend shutting down.
+  }
 }
 
 // -- the three ways the active site can change --------------------------------
@@ -196,9 +232,18 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
   schedule("window focus");
 });
 
+// 4. The blacklist changed in the popup. Adding the site you are looking at
+//    should light it up immediately rather than on your next navigation --
+//    which is the whole point of the "Block this site" button.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.blacklist) schedule("blacklist edited");
+});
+
 // Evaluate once at startup and on install/reload so the remembered state
 // matches reality immediately, instead of waiting for the user's next move.
 chrome.runtime.onStartup.addListener(() => schedule("browser startup"));
 chrome.runtime.onInstalled.addListener(() => schedule("extension loaded"));
 
-console.log(`[lockin] watching ${BLOCKED.length} domains:`, BLOCKED.join(", "));
+getBlacklist().then((list) =>
+  console.log(`[lockin] watching ${list.length} domains:`, list.join(", "))
+);

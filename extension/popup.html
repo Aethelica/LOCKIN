@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Lock In</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <h1>Lock In</h1>
+    <!-- Backend reachability. The single most useful thing on this panel:
+         every other row is meaningless if Python is not running. -->
+    <span id="conn" class="pill pill-off">checking…</span>
+  </header>
+
+  <section>
+    <label class="field-label" for="task">Task</label>
+    <input id="task" type="text" maxlength="200" autocomplete="off"
+           placeholder="what are you working on?">
+    <p id="task-note" class="note"></p>
+  </section>
+
+  <section class="rows">
+    <div class="row"><span>Attention</span><span id="attention" class="value">—</span></div>
+    <div class="row"><span>Browser</span><span id="browser" class="value">—</span></div>
+    <div class="row"><span>Session</span><span id="stats" class="value">—</span></div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Recent reminders</h2>
+      <button id="test" class="link-btn" type="button">Test</button>
+    </div>
+    <ul id="recent" class="recent"><li class="empty">nothing yet</li></ul>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Blacklist (<span id="bl-count">0</span>)</h2>
+      <button id="reset" class="link-btn" type="button" hidden>Reset</button>
+    </div>
+    <ul id="blacklist" class="blacklist"></ul>
+    <div class="add-row">
+      <input id="add" type="text" autocomplete="off" placeholder="add a domain">
+      <button id="block-this" type="button">Block this site</button>
+    </div>
+    <p id="bl-note" class="note"></p>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

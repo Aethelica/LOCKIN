@@ -22,8 +22,10 @@ pre{background:#f4f4f4;padding:1rem;white-space:pre-wrap}</style>
 <script type="module">
 const log = [];
 const sent = [];        // payloads background.js actually POSTed
-const listeners = { activated: [], updated: [], focus: [], startup: [], installed: [] };
+const listeners = { activated: [], updated: [], focus: [], startup: [], installed: [],
+                   changed: [] };
 const sessionStore = {};   // survives "worker restarts", like chrome.storage.session
+const localStore = {};     // the blacklist and the task, like chrome.storage.local
 
 let activeUrl = null;      // what chrome.tabs.query will report
 
@@ -44,7 +46,22 @@ globalThis.chrome = {
     session: {
       get: async (key) => (key in sessionStore ? { [key]: sessionStore[key] } : {}),
       set: async (obj) => Object.assign(sessionStore, obj),
+      remove: async (key) => { delete sessionStore[key]; },
     },
+    local: {
+      get: async (key) => (key in localStore ? { [key]: localStore[key] } : {}),
+      set: async (obj) => {
+        Object.assign(localStore, obj);
+        const changes = Object.fromEntries(
+          Object.keys(obj).map((k) => [k, { newValue: obj[k] }]));
+        listeners.changed.forEach((fn) => fn(changes, "local"));
+      },
+      remove: async (key) => {
+        delete localStore[key];
+        listeners.changed.forEach((fn) => fn({ [key]: {} }, "local"));
+      },
+    },
+    onChanged: evt("changed"),
   },
   runtime: { onStartup: evt("startup"), onInstalled: evt("installed") },
 };
@@ -53,7 +70,11 @@ globalThis.chrome = {
 // the failure path are all genuine.
 const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (url, init) => {
-  sent.push({ url, body: JSON.parse(init.body) });
+  // Only POSTs with a JSON body are events worth recording; GETs and the
+  // task push go straight through so the harness can also make its own calls.
+  if (init?.body && String(url).endsWith("/event")) {
+    sent.push({ url, body: JSON.parse(init.body) });
+  }
   return realFetch(url, init);
 };
 
@@ -83,6 +104,14 @@ async function fire(bucket, ...args) {
 window.T = {
   startWorker,
   restartWorker: startWorker,
+  /** Edit the blacklist the way the popup would. */
+  async setBlacklist(list) {
+    await chrome.storage.local.set({ blacklist: list });
+    await settle();
+    return this.take();
+  },
+  async setStoredTask(task) { await chrome.storage.local.set({ task }); },
+  stores() { return { local: localStore, session: sessionStore }; },
   /** Put the active tab on `url`, then fire the listener a real Chrome would. */
   async goto(url, how = "updated") {
     activeUrl = url;

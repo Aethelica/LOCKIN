@@ -1,0 +1,145 @@
+/* Clean and plain: system fonts, one accent, generous spacing.
+   Sized for a Chrome popup that sits alongside a visible terminal, so it is
+   dense rather than projector-sized. Follows the OS light/dark setting because
+   a popup that is the only bright rectangle on a dark demo machine looks
+   broken. */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1b1b1f;
+  --muted: #6b6b76;
+  --line: #e4e4e9;
+  --field: #f6f6f8;
+  --accent: #2f6df6;
+  --warn: #c2410c;
+  --warn-bg: #fff3ec;
+  --ok: #16794a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1f;
+    --fg: #ececf1;
+    --muted: #9a9aa5;
+    --line: #303036;
+    --field: #26262b;
+    --accent: #6f9bff;
+    --warn: #ffa06b;
+    --warn-bg: #37241a;
+    --ok: #5fd39b;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 320px;
+  margin: 0;
+  padding: 14px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 11px; font-weight: 600; margin: 0; color: var(--muted);
+     text-transform: uppercase; letter-spacing: 0.06em; }
+
+section { margin-bottom: 14px; }
+section:last-of-type { margin-bottom: 4px; }
+
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.field-label {
+  display: block; font-size: 11px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 5px;
+}
+
+input[type="text"] {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+}
+input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Status pill in the header */
+.pill {
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  white-space: nowrap;
+}
+.pill-on  { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.pill-off { background: var(--field); color: var(--muted); }
+
+.rows { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+}
+.row:last-child { border-bottom: none; }
+.value { color: var(--fg); font-weight: 500; text-align: right; }
+.value.warn { color: var(--warn); }
+.value.dim  { color: var(--muted); font-weight: 400; }
+
+.recent { list-style: none; margin: 0; padding: 0; }
+.recent li {
+  padding: 7px 9px; margin-bottom: 5px;
+  background: var(--field); border-radius: 6px;
+  border-left: 2px solid var(--accent);
+}
+.recent li.fallback { border-left-color: var(--warn); }
+.recent .meta { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); }
+.recent li.empty, .empty {
+  background: none; border-left: none; padding: 2px 0; color: var(--muted);
+}
+
+.blacklist { list-style: none; margin: 0 0 7px; padding: 0;
+             max-height: 116px; overflow-y: auto; }
+.blacklist li {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 3px 0;
+}
+.blacklist .here { color: var(--warn); font-weight: 600; }
+
+.add-row { display: flex; gap: 6px; }
+.add-row input { flex: 1; min-width: 0; }
+
+button {
+  font: inherit; font-size: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--field); color: var(--fg);
+  cursor: pointer; white-space: nowrap;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+.link-btn {
+  border: none; background: none; padding: 0;
+  color: var(--accent); font-size: 11px; font-weight: 600;
+}
+.remove {
+  border: none; background: none; padding: 0 2px;
+  color: var(--muted); font-size: 15px; line-height: 1;
+}
+.remove:hover { color: var(--warn); }
+
+.note { margin: 5px 0 0; font-size: 11px; color: var(--muted); min-height: 14px; }
+.note.error { color: var(--warn); }

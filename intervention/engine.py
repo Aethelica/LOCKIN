@@ -52,6 +52,10 @@ class Intervention:
     at: float
     source: str  # "llm" or "fallback"
 
+    # Carried through from the event, so a caller can say what the reminder was
+    # about without re-deriving it. Only browsing events set it today.
+    detail: str | None = None
+
     @property
     def is_fallback(self) -> bool:
         return self.source == "fallback"
@@ -127,6 +131,49 @@ class InterventionEngine:
             AttentionState.FACE_ABSENT, event.at, event.distracted_duration_s
         )
 
+    # -- on demand -------------------------------------------------------------
+
+    def rehearse(
+        self,
+        now: float,
+        kind: AttentionState = AttentionState.LOOKING_DOWN,
+        detail: str | None = None,
+    ) -> Intervention:
+        """Generate a line right now, whatever the cooldown says. Never None.
+
+        This exists for the popup's test button, and the two ways it differs
+        from handle() are both deliberate:
+
+        * It skips the policy gate. A test button that stayed silent because a
+          cooldown was running would be useless exactly when you need it -- on
+          stage, seconds after the last reminder.
+        * It does not call policy.record(). Rehearsing must not consume the
+          budget that protects the user from a real intervention, otherwise
+          testing the demo would suppress the demo.
+
+        It does still append to _recent, so a rehearsal and the real reminder
+        that follows it are not the same joke.
+        """
+        request = InterventionRequest(
+            kind=kind,
+            duration_s=0.0,
+            task=self.task,
+            recent_lines=tuple(self._recent),
+            detail=detail,
+        )
+
+        try:
+            text = self.provider.generate(request)
+            source = "llm"
+        except ProviderError:
+            text = fallback_line(kind, self._fallback_index)
+            self._fallback_index += 1
+            source = "fallback"
+
+        self._recent.append(text)
+        return Intervention(text=text, kind=kind, at=now, source=source,
+                            detail=detail)
+
     # -- shared path -----------------------------------------------------------
 
     def _speak(
@@ -163,5 +210,6 @@ class InterventionEngine:
         self.policy.record(kind, now)
         self._recent.append(text)
 
-        return Intervention(text=text, kind=kind, at=now, source=source)
+        return Intervention(text=text, kind=kind, at=now, source=source,
+                            detail=detail)
 

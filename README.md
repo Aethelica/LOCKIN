@@ -48,7 +48,9 @@ Speech flags: `--no-speak` (print only), `--voice NAME`, `--rate WPM`,
 `--speech-max-age SEC`.
 
 `--browser` additionally listens for the Chrome extension on
-`http://127.0.0.1:8765`. See **Browser tracking** below.
+`http://127.0.0.1:8765`, and is what the popup talks to. With it running you can
+set your task, edit the blacklist and fire a test reminder from the toolbar
+instead of the command line. See **Browser tracking** below.
 
 Keys: `q` quit, `c` recalibrate, `d` toggle debug numbers.
 
@@ -90,14 +92,24 @@ webcam frame                          Chrome active tab
                           │    ├─ anthropic_provider.py  Claude API call
                           │    └─ prompts.py         personality + canned fallbacks
                           │
-                          └─ speech/           text -> sound, on a worker thread
-                               ├─ service.py       queue: order, limits, staleness
-                               └─ macos_say.py     /usr/bin/say, one subprocess each
+                          ├─ speech/           text -> sound, on a worker thread
+                          │    ├─ service.py       queue: order, limits, staleness
+                          │    └─ macos_say.py     /usr/bin/say, one subprocess each
+                          │
+                          └─ browser/state.py  AppState: what the popup may see
+                                  ▲
+                                  │  GET /status  (polled while the popup is open)
+                                  └─ extension/popup.js
 ```
 
 The two detectors converge on one type and share everything after it. Adding
 browser tracking required no new code in `intervention/` or `speech/` — only a
 new `AttentionState` value, a prompt line, and a set of fallback lines.
+
+The popup reads `AppState` and never touches the vision loop, the engine or the
+speech queue directly. That is deliberate: those objects belong to the frame
+loop and are not thread-safe, so the HTTP threads copy a few scalars under a
+lock instead of reaching into live objects.
 
 Two seams hold this together, and both are deliberate:
 
@@ -178,6 +190,7 @@ blocking, no tab closing, no LLM, no API key, no page content.
 2. Open `chrome://extensions` and turn on **Developer mode** (top right).
 3. Click **Load unpacked** and choose the `extension/` folder in this repo.
 4. Browse to youtube.com. A reminder should follow within a second or two.
+5. Click the Lock In toolbar icon for the popup — status, task, blacklist.
 
 Chrome removed `--load-extension` from the command line, so step 3 has to be
 done by hand. Re-click the extension's **reload** arrow after editing any file
@@ -185,13 +198,19 @@ in `extension/`.
 
 ### Configuring it
 
-Everything editable is in **`extension/config.js`**:
+The blacklist is edited **in the popup** — click the toolbar icon, type a domain
+or press *Block this site*. Your list lives in `chrome.storage.local` and
+survives browser restarts.
+
+`extension/config.js` holds the **defaults** that *Reset* restores, plus the
+wiring:
 
 | Constant | What it does |
 | --- | --- |
-| `BLACKLIST` | The distracting domains. Bare domains, one per line. |
-| `BACKEND_URL` | `http://127.0.0.1:8765/event` — must match `--browser-port`. |
+| `DEFAULT_BLACKLIST` | Starting domains, and what *Reset* restores. |
+| `BACKEND_ORIGIN` | `http://127.0.0.1:8765` — must match `--browser-port`. |
 | `REQUEST_TIMEOUT_MS` | How long to wait for the backend before giving up. |
+| `POLL_INTERVAL_MS` | How often the popup re-reads `/status` while open. |
 
 Changing the port means changing it in three places: `config.js`,
 `manifest.json`'s `host_permissions`, and `--browser-port`.
@@ -254,7 +273,7 @@ arrives during a cooldown is dropped before any API call is made.
 | Permission | Why |
 | --- | --- |
 | `tabs` | The only way to read the active tab's `url`. Without it `tab.url` is `undefined`. The alternative — a host permission for every site — would be far broader. |
-| `storage` | For the single `chrome.storage.session` string above. |
+| `storage` | Two stores, chosen separately: `session` (memory-only, wiped on browser exit) for "which blacklisted site am I on"; `local` (persistent) for your blacklist and your task. Nothing about the sites you visit is ever written to disk. |
 | `host_permissions: http://127.0.0.1:8765/*` | The one address it may `fetch`. Not `<all_urls>`, not a wildcard port. |
 
 There are **no content scripts**. Nothing is injected into any page and no page
@@ -278,9 +297,17 @@ because that string ends up inside an LLM prompt.
 
 ### When the backend is down
 
-The `fetch` fails, one warning is logged, the event is dropped, and the service
-worker carries on. There is no retry — a retry would fire while you are still on
-the same site, which is the exact duplicate the extension exists to prevent.
+The `fetch` fails, a warning is logged, the event is dropped, and the service
+worker carries on. There is no retry *timer* — a timer would fire while you are
+still on the same site and re-send the exact duplicate the extension exists to
+prevent.
+
+What it does instead is **forget the stored domain on a failed send**, so the
+next navigation tries again naturally. That fixes a specific demo-day trap:
+open Chrome on YouTube, start Lock In afterwards, and the one event that
+mattered was already dropped — without this, nothing fires until you navigate
+away and back. The cost is one failed `fetch` per navigation while Lock In is
+down, which is a refused connection and returns instantly.
 
 ### Watching it work
 
@@ -300,6 +327,9 @@ Backend side, in the terminal running the demo:
            LOCK IN: Instagram's still going to be there in three hours, ...
 ```
 
+Quickest check of all: open the popup. If the pill says **connected**, the
+extension can reach Lock In, and *Test* will prove the whole chain end to end.
+
 If neither side shows anything, check the port; if the extension logs
 `backend unreachable`, Lock In is not running or is on a different port. To test
 the LLM and speech ends of the chain without Chrome at all:
@@ -307,6 +337,79 @@ the LLM and speech ends of the chain without Chrome at all:
 ```bash
 python scripts/try_browser.py --fake youtube.com --interventions --speak
 ```
+
+### The popup
+
+Click the toolbar icon. Everything Lock In knows, in one panel.
+
+```
+Lock In                        connected
+─────────────────────────────────────────
+Task     [ finish the SPIS report      ]
+
+Attention                       attentive
+Browser                       youtube.com
+Session          3 said · 11 held · 24m
+─────────────────────────────────────────
+RECENT REMINDERS                     Test
+  I see the SPIS report got traded in
+  for the infinite scroll.
+  youtube.com · 10s ago
+─────────────────────────────────────────
+BLACKLIST (4)                       Reset
+  youtube.com                          ×
+  reddit.com                           ×
+  [ add a domain ]  [ Block this site ]
+```
+
+**What comes from where** is the thing to understand, and it is why the panel
+degrades gracefully:
+
+| From the backend (`GET /status`, polled 1×/s) | From Chrome (no network) |
+| --- | --- |
+| Attention state, session stats, recent reminders, the task Python holds | Which site the active tab is on, whether it matched, the blacklist itself |
+
+Everything in the right-hand column keeps working with Python stopped, so
+editing your blacklist never depends on having started the backend. With Lock In
+down the panel says **not running**, greys out *Test*, and stays fully usable
+for everything else.
+
+The popup exists only while it is open — closing it stops the polling. There is
+no background timer.
+
+**Task.** Typing a task stores it in Chrome, not in Python, and that is the
+point: restarting the backend mid-demo used to lose it. Every `/event` reply
+tells the extension whether the backend currently has a task, and a freshly
+started Lock In says no — so the next distraction repairs it automatically, with
+no polling and no heartbeat. `--task` still works and is what a run without the
+extension uses.
+
+**Test.** Fires the whole chain on demand — LLM, console, voice — ignoring the
+cooldown, so you can prove the system works on stage instead of standing there
+looking away and hoping. It deliberately does *not* consume the cooldown budget,
+so rehearsing never suppresses the real reminder that follows. If the active tab
+is on a blacklisted site the rehearsal is about that site.
+
+**Session.** `3 said · 11 held` — "held" is the cooldown policy visibly doing
+its job. It is the most concrete evidence that the two-gate design is real, and
+the easiest way to explain it to someone watching.
+
+### The local API
+
+`browser/server.py` serves five routes on `127.0.0.1:8765`, loopback only:
+
+| Route | Purpose |
+| --- | --- |
+| `POST /event` | The extension reports a blacklisted domain. Replies `{ok, has_task}`. |
+| `GET /health` | Is anything listening? |
+| `GET /status` | Everything the popup shows. |
+| `POST /task` | Set what the user is working on. |
+| `POST /test` | Queue one rehearsal. |
+
+The first two work with no popup session attached; the last three answer `503`
+rather than inventing data. No route generates text or makes a sound — `/event`
+and `/test` both just put something in a queue for the frame loop, so no network
+call ever happens on an HTTP worker thread.
 
 ## Tests
 
@@ -329,12 +432,27 @@ tested is the browser's own `URL` parser — stubbing it would test the stub:
 python3 -m http.server 8000
 open http://localhost:8000/tests/extension/runner.html        # domain rules
 open http://localhost:8000/tests/extension/worker_runner.html # the state machine
+open http://localhost:8000/tests/extension/popup_runner.html  # the popup itself
 ```
 
-`runner.html` reports pass/fail on the page. `worker_runner.html` loads the real
-`background.js` with a stubbed `chrome.*` API and a real `fetch` to the running
-backend; drive it from the devtools console with `await T.goto("https://...")`,
-which returns the payloads the extension sent.
+`runner.html` reports pass/fail on the page.
+
+The two `*_runner.html` pages exist because Chrome 137+ removed
+`--load-extension` from the command line, so a real unpacked extension cannot be
+opened by a script. Each loads the **real** extension source with the four
+`chrome.*` calls it makes stubbed out, and a **real** `fetch` to the running
+backend:
+
+- `worker_runner.html` — drive `background.js` with
+  `await T.goto("https://youtube.com/")`, which returns the payloads it sent.
+  `T.restartWorker()` simulates Chrome killing an idle MV3 service worker.
+- `popup_runner.html` — renders the real popup. `setTab(url)` changes the
+  simulated active tab, `resetHarness()` clears stored state.
+
+If your edits do not seem to take effect, it is the browser cache, not your
+code: `python -m http.server` sends no `Cache-Control`, so Chrome holds on to
+old ES modules. Hard-reload, or serve on a different port. The real extension
+loads from disk and never has this problem.
 
 ## Status
 
@@ -342,4 +460,4 @@ which returns the payloads the extension sent.
 - [x] LLM interventions
 - [x] Text-to-speech
 - [x] Browser / activity tracking (detection only — no blocking yet)
-- [ ] UI
+- [x] UI — the extension popup

@@ -145,7 +145,7 @@ def describe(event) -> str:
             f"(was {event.previous.value} for {event.distracted_duration_s:.1f}s)")
 
 
-def handle_event(event, engine, speech) -> None:
+def handle_event(event, engine, speech, state=None) -> None:
     """Print it, maybe generate a reminder, maybe say it out loud.
 
     The single call site for the whole intervention subsystem, and the reason
@@ -155,9 +155,18 @@ def handle_event(event, engine, speech) -> None:
     treats them the same.
     """
     print(describe(event))
+    if state is not None:
+        state.record_event()
 
     if engine is None:
         return
+
+    # The popup can change the task at any moment; the engine reads it fresh on
+    # every request. One assignment is cheaper and clearer than making the
+    # engine reach into AppState, and it keeps intervention/ unaware that a UI
+    # exists at all.
+    if state is not None:
+        engine.task = state.task
 
     # Still blocks for up to ~4s while the API answers, which freezes the video
     # feed -- acceptable because it only happens while the user is already
@@ -166,8 +175,34 @@ def handle_event(event, engine, speech) -> None:
     if result is None:
         return
 
+    _deliver(result, speech, state)
+
+
+def handle_rehearsal(domain, engine, speech, state) -> None:
+    """The popup's test button: one reminder, now, cooldown or not.
+
+    Not counted as a distraction event -- nothing was detected. See
+    InterventionEngine.rehearse() for why it also does not consume the cooldown.
+    """
+    if engine is None:
+        print("           (test reminder needs --interventions)")
+        return
+
+    engine.task = state.task if state is not None else engine.task
+    kind = AttentionState.BROWSING_DISTRACTING if domain else AttentionState.LOOKING_DOWN
+    result = engine.rehearse(time.monotonic(), kind=kind, detail=domain)
+    print(f"[{result.at:8.1f}s] TEST reminder requested from the popup")
+    _deliver(result, speech, state)
+
+
+def _deliver(result, speech, state) -> None:
+    """Console, then the popup's history, then the speaker. Shared by both paths."""
     tag = "FALLBACK" if result.is_fallback else "LOCK IN"
     print(f"           {tag}: {result.text}")
+
+    if state is not None:
+        state.record_intervention(result.text, result.kind, result.detail,
+                                  result.source, result.at)
 
     # Speech is the opposite: say() stamps the text and returns in
     # microseconds, so the several seconds of talking happen on the speech
@@ -182,7 +217,7 @@ def handle_event(event, engine, speech) -> None:
 
 
 def build_browser(args):
-    """Start the localhost endpoint the Chrome extension posts to, or None.
+    """Start the localhost endpoint the extension talks to. Returns (server, state).
 
     Imported inside the function for the same reason build_engine() is: the
     default path through this script must not depend on a later phase.
@@ -192,18 +227,23 @@ def build_browser(args):
     problem than refusing to run the webcam at all.
     """
     if not args.browser:
-        return None
+        return None, None
 
     from browser.server import BrowserEventServer
+    from browser.state import AppState
 
-    server = BrowserEventServer(port=args.browser_port)
+    # Created even without --interventions: the popup should still show the
+    # attention state and the browsing state on a run with no API key.
+    state = AppState(task=args.task)
+
+    server = BrowserEventServer(port=args.browser_port, state=state)
     try:
         server.start()
     except OSError as exc:
         print(f"[browser] disabled: cannot listen on port {args.browser_port} ({exc})",
               file=sys.stderr)
-        return None
-    return server
+        return None, None
+    return server, state
 
 
 def build_engine(args):
@@ -285,7 +325,7 @@ def main() -> None:
     speech = build_speech(args) if engine is not None else None
     # Independent of the engine: browser events are worth seeing on the console
     # even without an API key, exactly as webcam events are.
-    browser = build_browser(args)
+    browser, state = build_browser(args)
 
     calibration = Calibration.load()
     cap = open_camera(args.camera)
@@ -330,7 +370,16 @@ def main() -> None:
                     events.extend(browser.drain())
 
                 for event in events:
-                    handle_event(event, engine, speech)
+                    handle_event(event, engine, speech, state)
+
+                if state is not None:
+                    # Published every frame so the popup's attention row tracks
+                    # the overlay exactly. Two scalars under a lock at 15fps.
+                    state.set_attention(monitor.state)
+
+                if browser is not None:
+                    for domain in browser.drain_tests():
+                        handle_rehearsal(domain, engine, speech, state)
 
                 frame = draw_overlay(frame, signals, monitor, config, now, show_debug)
                 cv2.imshow("Lock In - vision", frame)
@@ -345,6 +394,10 @@ def main() -> None:
                     # about a session that no longer exists.
                     if speech is not None:
                         speech.cancel_all()
+                    if state is not None:
+                        # The popup would otherwise keep showing the last state
+                        # from a session that no longer exists.
+                        state.set_attention(None)
                     extractor.calibration = run_calibration(cap, extractor)
                     monitor = AttentionMonitor(config)
 

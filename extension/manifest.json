@@ -2,19 +2,32 @@
   "manifest_version": 3,
   "name": "Lock In - activity tracker",
   "version": "0.1.0",
-  "description": "Tells the Lock In backend when the active tab is on a blacklisted site. Sends nothing else.",
-
+  "description": "Tells the Lock In backend when the active tab is on a distracting site, and shows the session in a popup. Sends only the domain.",
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
-
   "permissions": [
     "tabs",
     "storage"
   ],
-
   "host_permissions": [
     "http://127.0.0.1:8765/*"
-  ]
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Lock In",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }
